@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 import re
 import logging
 from urllib.parse import urljoin
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import telebot
@@ -55,8 +55,6 @@ def make_request(url, method='get', **kwargs):
             )
             response.raise_for_status()
             logger.info(f"Success on attempt {attempt + 1} for {url}")
-            # Log to keep Render.com process alive
-            print(f"Request succeeded for {url}", flush=True)
             return response
         except requests.exceptions.RequestException as e:
             logger.warning(f"Attempt {attempt + 1} failed for {url}: {str(e)}")
@@ -76,14 +74,13 @@ def upload_file(file_buffer, filename):
     if file_size_mb > MAX_FILE_SIZE_MB:
         raise ScraperError(f"File {filename} is {file_size_mb:.2f} MB, exceeds {MAX_FILE_SIZE_MB} MB limit")
 
-    # Try Catbox
+    # 1. Try Catbox
     try:
         files = {'fileToUpload': (filename, file_buffer, 'text/html')}
         data = {'reqtype': 'fileupload'}
         response = requests.post("https://catbox.moe/user/api.php", files=files, data=data)
         if response.status_code == 200 and response.text.startswith("https://"):
             logger.info(f"Uploaded to Catbox: {response.text.strip()}")
-            print(f"File uploaded: {filename}", flush=True)  # Log to keep process alive
             return response.text.strip()
     except Exception as e:
         logger.error(f"Catbox upload failed: {str(e)}")
@@ -108,7 +105,7 @@ def generate_links(start_year, end_year, username, title_only=False):
     base_url = f"{BASE_URL}/search/{search_id}/"
     title_flag = 1 if title_only else 0
 
-    # Extended date ranges with 3-day buffer
+    # Extended date ranges with 3-day buffer before and after
     months = [
         ("12-13", "01-03"), ("11-28", "12-18"), ("11-13", "12-03"), ("10-29", "11-18"),
         ("10-13", "11-03"), ("09-28", "10-18"), ("09-13", "10-03"), ("08-29", "09-18"),
@@ -122,6 +119,7 @@ def generate_links(start_year, end_year, username, title_only=False):
 
     for year in range(end_year, start_year - 1, -1):
         for start_month, end_month in months:
+            # Adjust years for date ranges crossing year boundaries
             start_year_adj = year - 1 if start_month.startswith("12-") else year
             end_year_adj = year + 1 if end_month.startswith("01-") else year
 
@@ -135,12 +133,15 @@ def generate_links(start_year, end_year, username, title_only=False):
                 logger.error(f"Invalid date format: {start_date} to {end_date} - {str(e)}")
                 continue
 
+            # Skip if start date is in the future
             if start_dt > now:
                 continue
 
+            # Adjust end date if it exceeds current date
             if end_dt > now:
                 end_date = now.strftime("%Y-%m-%d")
 
+            # Validate date range
             if start_dt >= end_dt:
                 logger.warning(f"Invalid date range: {start_date} to {end_date}")
                 continue
@@ -158,34 +159,39 @@ def generate_links(start_year, end_year, username, title_only=False):
         logger.warning(f"No valid URLs generated for username: {username}")
 
     logger.info(f"Generated {len(links)} search URLs for {username}")
-    print(f"Generated URLs for {username}: {len(links)}", flush=True)  # Log to keep process alive
     return links
 
 def split_url(url, start_date, end_date, max_pages=MAX_PAGES_PER_SEARCH):
     """Split search URL into smaller date ranges with 3-day buffer until pages < 10."""
     try:
+        # Parse start and end dates
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
+        # Validate date range
         if start_dt >= end_dt:
             logger.warning(f"Invalid date range: {start_date} to {end_date}")
             return [(url, start_date, end_date)]
 
+        # Add 3-day buffer before and after
         buffered_start_dt = start_dt - timedelta(days=3)
         buffered_end_dt = end_dt + timedelta(days=3)
         now = datetime.now()
 
+        # Ensure buffered dates don't exceed current date or go before reasonable start
         if buffered_end_dt > now:
             buffered_end_dt = now
-        if buffered_start_dt.year < 2010:
+        if buffered_start_dt.year < 2010:  # Assuming 2010 as minimum year
             buffered_start_dt = datetime(2010, 1, 1)
 
         buffered_start_date = buffered_start_dt.strftime("%Y-%m-%d")
         buffered_end_date = buffered_end_dt.strftime("%Y-%m-%d")
 
+        # Update URL with buffered dates
         buffered_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={buffered_start_date}", url)
         buffered_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={buffered_end_date}", buffered_url)
 
+        # Make request to check pagination
         try:
             response = make_request(buffered_url)
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -198,20 +204,25 @@ def split_url(url, start_date, end_date, max_pages=MAX_PAGES_PER_SEARCH):
             logger.error(f"Failed to fetch or parse pagination for {buffered_url}: {str(e)}")
             return [(buffered_url, buffered_start_date, buffered_end_date)]
 
+        # If pages are less than 10, return the URL with buffered dates
         if total_pages < max_pages:
             return [(buffered_url, buffered_start_date, buffered_end_date)]
 
+        # Calculate midpoint for splitting
         total_days = (buffered_end_dt - buffered_start_dt).days
-        if total_days <= 1:
+        if total_days <= 1:  # Prevent infinite recursion for very small ranges
             logger.warning(f"Cannot split range further: {buffered_start_date} to {buffered_end_date}")
             return [(buffered_url, buffered_start_date, buffered_end_date)]
 
         mid_dt = buffered_start_dt + timedelta(days=total_days // 2)
+
+        # Define two new date ranges with 3-day buffers
         first_range_start = buffered_start_dt
-        first_range_end = mid_dt + timedelta(days=3)
-        second_range_start = mid_dt - timedelta(days=3)
+        first_range_end = mid_dt + timedelta(days=3)  # Add 3-day buffer to end
+        second_range_start = mid_dt - timedelta(days=3)  # Add 3-day buffer to start
         second_range_end = buffered_end_dt
 
+        # Ensure dates don't exceed boundaries
         if first_range_end > now:
             first_range_end = now
         if second_range_start > now:
@@ -220,12 +231,13 @@ def split_url(url, start_date, end_date, max_pages=MAX_PAGES_PER_SEARCH):
         first_range = (first_range_start.strftime("%Y-%m-%d"), first_range_end.strftime("%Y-%m-%d"))
         second_range = (second_range_start.strftime("%Y-%m-%d"), second_range_end.strftime("%Y-%m-%d"))
 
+        # Update URLs for new ranges
         first_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={first_range[0]}", buffered_url)
         first_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={first_range[1]}", first_url)
         second_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={second_range[0]}", buffered_url)
         second_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={second_range[1]}", second_url)
 
-        print(f"Splitting URL for {start_date} to {end_date}", flush=True)  # Log to keep process alive
+        # Recursively split the new ranges
         return (split_url(first_url, first_range[0], first_range[1], max_pages) +
                 split_url(second_url, second_range[0], second_range[1], max_pages))
 
@@ -248,7 +260,6 @@ def fetch_page_data(url, page=None):
             [int(link.text.strip()) for link in pagination.find_all('a') if link.text.strip().isdigit()]
         ) if pagination else 1
         logger.debug(f"Fetched {len(links)} post links from {full_url}, total pages: {total_pages}")
-        print(f"Fetched page data for {full_url}", flush=True)  # Log to keep process alive
         return links, total_pages
     except Exception as e:
         logger.error(f"Failed to fetch page data for {full_url}: {str(e)}")
@@ -368,7 +379,6 @@ def process_post(post_link, username, start_year, end_year, media_by_date, globa
                 else:
                     logger.debug(f"Duplicate {media_type} skipped in {post_link}: {src}")
                 
-        print(f"Processed post: {post_link}", flush=True)  # Log to keep process alive
     except Exception as e:
         logger.error(f"Failed to process post {post_link}: {str(e)}")
 
@@ -629,7 +639,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
 
     html_content = "".join(html_fragments)
     logger.debug(f"Generated HTML with {total_items} items")
-    print(f"HTML generated for {usernames_str}", flush=True)  # Log to keep process alive
     return html_content
 
 def send_telegram_message(chat_id, text, **kwargs):
@@ -642,7 +651,6 @@ def send_telegram_message(chat_id, text, **kwargs):
             if attempt == MAX_RETRIES - 1:
                 raise ScraperError(f"Failed to send message: {str(e)}")
             time.sleep(1 * (attempt + 1))
-    print(f"Sent Telegram message to {chat_id}", flush=True)  # Log to keep process alive
 
 def cancel_task(chat_id):
     """Cancel an active scraping task."""
@@ -651,9 +659,7 @@ def cancel_task(chat_id):
         for future in futures:
             future.cancel()
         executor._threads.clear()
-        executor.shutdown(wait=False)
         del active_tasks[chat_id]
-        print(f"Task cancelled for chat_id: {chat_id}", flush=True)  # Log to keep process alive
         return True
     return False
 
@@ -733,7 +739,6 @@ def telegram_webhook():
                     message_id=progress_msg.message_id,
                     text=f"🔍 Processing '{usernames_display}' ({start_year}-{end_year}): Scraping '{username}'..."
                 )
-                print(f"Starting scrape for {username}", flush=True)  # Log to keep process alive
                 
                 all_post_links = []
                 seen_links = set()
@@ -763,7 +768,6 @@ def telegram_webhook():
                                 links, _ = future.result()
                                 all_post_links.extend(link for link in links if link not in seen_links)
                                 seen_links.update(links)
-                                print(f"Processed page for {username}", flush=True)  # Log to keep process alive
                             except ScraperError as e:
                                 logger.error(f"Page fetch failed for {username}: {str(e)}")
                                 continue
@@ -800,7 +804,6 @@ def telegram_webhook():
                                      f"'{username}' - {processed_count}/{total_posts} posts "
                                      f"({(processed_count/total_posts*100):.1f}%)"
                             )
-                            print(f"Progress: {username} - {processed_count}/{total_posts} posts", flush=True)  # Log to keep process alive
                     except ScraperError as e:
                         logger.error(f"Post processing failed for {username}: {str(e)}")
                         continue
@@ -876,9 +879,7 @@ def telegram_webhook():
             if chat_id in active_tasks:
                 executor, _ = active_tasks[chat_id]
                 executor._threads.clear()
-                executor.shutdown(wait=False)
                 del active_tasks[chat_id]
-                print(f"Task cleanup completed for {chat_id}", flush=True)  # Log to keep process alive
 
         return '', 200
     
@@ -896,21 +897,24 @@ def telegram_webhook():
         if chat_id in active_tasks:
             executor, _ = active_tasks[chat_id]
             executor._threads.clear()
-            executor.shutdown(wait=False)
             del active_tasks[chat_id]
         return '', 200
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "time": datetime.now().isoformat()})
+
 def set_webhook():
-    """Set Telegram webhook for Render.com."""
-    render_url = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+    """Set Telegram webhook."""
+    render_url = os.environ.get('RENDER_PUBLIC_DOMAIN')
     if render_url:
         webhook_url = f"https://{render_url}/telegram"
         bot.set_webhook(url=webhook_url)
         logger.info(f"Webhook set to: {webhook_url}")
-        print(f"Webhook set to: {webhook_url}", flush=True)  # Log to keep process alive
     else:
-        logger.error("RENDER_EXTERNAL_HOSTNAME not set")
-        raise ScraperError("RENDER_EXTERNAL_HOSTNAME not set")
+        logger.error("RENDER_PUBLIC_DOMAIN not set")
+        raise ScraperError("RENDER_PUBLIC_DOMAIN not set")
 
 # Telegram Bot Setup
 try:
