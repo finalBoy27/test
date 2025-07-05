@@ -3,6 +3,8 @@ requests
 beautifulsoup4
 cloudscraper
 pyTelegramBotAPI
+python-telegram-bot
 python-dotenv
 flask
 schedule
+fcntl
