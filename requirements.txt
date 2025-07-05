@@ -7,4 +7,3 @@ python-telegram-bot
 python-dotenv
 flask
 schedule
-fcntl
