@@ -702,42 +702,50 @@ def cancel_task(chat_id):
     return False
 
 def process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year):
-    """Process and send images in batches, deleting sent images from memory."""
-    all_images = []
-    for username in usernames:
-        media_by_date = media_by_date_per_username[username]
-        for date in sorted(media_by_date['images'].keys(), reverse=True):
-            for image_url in media_by_date['images'][date]:
-                all_images.append((image_url, username, date))
-        for date in sorted(media_by_date['gifs'].keys(), reverse=True):
-            for image_url in media_by_date['gifs'][date]:
-                all_images.append((image_url, username, date))
-
-    all_images.sort(key=lambda x: x[2], reverse=True)  # Sort by date, newest first
-    total_images = len(all_images)
+    """Process and send images/GIFs in batches with username caption."""
+    from telegram import InputMediaPhoto
+    import logging
     sent_images = 0
+    BATCH_SIZE = 10  # Telegram API limit for media group
 
-    while all_images and chat_id in active_tasks:
-        batch = all_images[:BATCH_SIZE]
-        all_images = all_images[BATCH_SIZE:]  # Remove sent batch
+    for username in usernames:
+        # Combine images and GIFs for the username
+        media_by_date = media_by_date_per_username.get(username, {'images': {}, 'gifs': {}})
+        all_dates = set(media_by_date['images'].keys()) | set(media_by_date['gifs'].keys())
 
-        # Send the batch
-        if send_image_batch(chat_id, batch):
-            sent_images += len(batch)
-            # Remove sent images from media_by_date_per_username
-            for image_url, username, date in batch:
-                if image_url in media_by_date_per_username[username]['images'].get(date, []):
-                    media_by_date_per_username[username]['images'][date].remove(image_url)
-                    if not media_by_date_per_username[username]['images'][date]:
-                        del media_by_date_per_username[username]['images'][date]
-                elif image_url in media_by_date_per_username[username]['gifs'].get(date, []):
-                    media_by_date_per_username[username]['gifs'][date].remove(image_url)
-                    if not media_by_date_per_username[username]['gifs'][date]:
-                        del media_by_date_per_username[username]['gifs'][date]
+        for date in sorted(all_dates):
+            # Filter media by year
+            if not (str(start_year) <= date[:4] <= str(end_year)):
+                continue
 
-        # Free memory
-        del batch
-        time.sleep(1)  # Brief pause to avoid overwhelming Telegram API
+            # Get images and GIFs for the date
+            images = media_by_date['images'].get(date, [])
+            gifs = media_by_date['gifs'].get(date, [])
+            all_media = images + gifs
+
+            # Process in batches of BATCH_SIZE
+            for i in range(0, len(all_media), BATCH_SIZE):
+                batch = all_media[i:i + BATCH_SIZE]
+                if not batch:
+                    continue
+
+                media_group = []
+                for url in batch:
+                    try:
+                        # Use InputMediaPhoto for both images and GIFs (Telegram handles GIFs as photos in media groups)
+                        media_group.append(InputMediaPhoto(media=url, caption=username if media_group else username))
+                    except Exception as e:
+                        logging.error(f"Failed to add media {url} for {username}: {str(e)}")
+                        continue
+
+                if media_group:
+                    try:
+                        # Send media group with username as caption for the first item
+                        send_media_group(chat_id, media_group)
+                        sent_images += len(media_group)
+                    except Exception as e:
+                        logging.error(f"Failed to send media group for {username} on {date}: {str(e)}")
+                        continue
 
     return sent_images
 
