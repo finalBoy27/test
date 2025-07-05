@@ -16,6 +16,7 @@ import cloudscraper
 from telebot.apihelper import ApiTelegramException
 
 load_dotenv()
+
 # Initialize logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -27,15 +28,16 @@ app = Flask(__name__)
 
 # Configuration
 MAX_RETRIES = 3
-MAX_WORKERS = 3
-MAX_PAGES_PER_SEARCH = 5
+MAX_WORKERS = 2
+MAX_PAGES_PER_SEARCH = 10
 BASE_URL = "https://desifakes.com"
 MAX_FILE_SIZE_MB = 10  # Max file size for upload (in MB)
 POLLING_TIMEOUT = 30  # Increased timeout for polling
 POLLING_INTERVAL = 1  # Interval between polls
 CONFLICT_RETRY_DELAY = 5  # Delay for retrying on 409 conflict
-MAX_IMAGE_UPLOAD_RETRIES = 3  # Max retries for downloading images
-IMAGES_PER_BATCH = 5  # Number of images to send per batch
+GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')  # Add group chat ID to .env
+MAX_IMAGE_RETRIES = 3  # Max retries for downloading images
+BATCH_SIZE = 5  # Number of images per batch
 
 # Global task tracking
 active_tasks = {}
@@ -66,19 +68,21 @@ def make_request(url, method='get', **kwargs):
                 raise ScraperError(f"Failed for {url} after {MAX_RETRIES} attempts: {str(e)}")
             time.sleep(1 * (attempt + 1))
 
-def download_image(url):
-    """Download an image with retries."""
-    for attempt in range(MAX_IMAGE_UPLOAD_RETRIES):
+def download_image(image_url):
+    """Download an image with retries, returning None if it fails."""
+    for attempt in range(MAX_IMAGE_RETRIES):
         try:
-            response = make_request(url)
+            response = make_request(image_url)
             if response.status_code == 200:
                 return BytesIO(response.content)
-            logger.warning(f"Attempt {attempt + 1} failed to download image {url}: Status {response.status_code}")
+            else:
+                logger.warning(f"Failed to download {image_url} on attempt {attempt + 1}: Status {response.status_code}")
         except ScraperError as e:
-            logger.warning(f"Attempt {attempt + 1} failed to download image {url}: {str(e)}")
-        if attempt < MAX_IMAGE_UPLOAD_RETRIES - 1:
-            time.sleep(1 * (attempt + 1))
-    logger.error(f"Failed to download image {url} after {MAX_IMAGE_UPLOAD_RETRIES} attempts")
+            logger.warning(f"Download attempt {attempt + 1} failed for {image_url}: {str(e)}")
+        except Exception as e:
+            logger.warning(f"Unexpected error downloading {image_url} on attempt {attempt + 1}: {str(e)}")
+        time.sleep(1 * (attempt + 1))
+    logger.error(f"Failed to download {image_url} after {MAX_IMAGE_RETRIES} attempts")
     return None
 
 def upload_file(file_buffer, filename):
@@ -90,7 +94,6 @@ def upload_file(file_buffer, filename):
     if file_size_mb > MAX_FILE_SIZE_MB:
         raise ScraperError(f"File {filename} is {file_size_mb:.2f} MB, exceeds {MAX_FILE_SIZE_MB} MB limit")
 
-    # Try Catbox
     try:
         files = {'fileToUpload': (filename, file_buffer, 'text/html')}
         data = {'reqtype': 'fileupload'}
@@ -179,9 +182,6 @@ def split_url(url, start_date, end_date, max_pages=MAX_PAGES_PER_SEARCH):
 
         first_end = (mid_dt - timedelta(days=1)).strftime("%Y-%m-%d")
         second_start = (mid_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        first_range = (start_date, first_end)
-        second_range = (second_start, end_date)
 
         first_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={first_range[0]}", url)
         first_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={first_range[1]}", first_url)
@@ -541,7 +541,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
           }}
         }}
 
-        // Lazy load images and videos
         const lazyElements = document.querySelectorAll('.lazy');
         const observer = new IntersectionObserver((entries, observer) => {{
           entries.forEach(entry => {{
@@ -616,7 +615,11 @@ def send_telegram_message(chat_id, text, **kwargs):
         try:
             return bot.send_message(chat_id=chat_id, text=text, **kwargs)
         except ApiTelegramException as e:
-            if e.error_code == 409:
+            if e.error_code == 429:  # Too Many Requests
+                retry_after = int(e.result_json.get('parameters', {}).get('retry_after', 5))
+                logger.warning(f"429 Too Many Requests, waiting {retry_after} seconds")
+                time.sleep(retry_after)
+            elif e.error_code == 409:
                 logger.warning(f"409 Conflict in send_message, attempt {attempt + 1}: {str(e)}")
                 time.sleep(CONFLICT_RETRY_DELAY)
             else:
@@ -630,67 +633,47 @@ def send_telegram_message(chat_id, text, **kwargs):
                 raise ScraperError(f"Failed to send message: {str(e)}")
             time.sleep(1 * (attempt + 1))
 
-def send_telegram_images(chat_id, image_list, media_by_date_per_username, usernames, start_year, end_year):
-    """Send images in batches of 5 with captions and remove them from the media database."""
-    total_images = len(image_list)
-    logger.info(f"Preparing to send {total_images} images to Telegram for chat_id {chat_id}")
-
-    for i in range(0, total_images, IMAGES_PER_BATCH):
-        batch = image_list[i:i + IMAGES_PER_BATCH]
-        media_group = []
-        successful_images = []
-        failed_images = []
-
-        for img_url, username, date in batch:
-            try:
-                image_data = download_image(img_url)
-                if image_data:
-                    caption = f"📸 {username} - {date}"
-                    media_group.append(telebot.types.InputMediaPhoto(media=image_data, caption=caption))
-                    successful_images.append((img_url, username, date))
-                else:
-                    failed_images.append((img_url, username, date))
-                    logger.warning(f"Skipping image {img_url} for {username} after {MAX_IMAGE_UPLOAD_RETRIES} failed attempts")
-            except Exception as e:
-                failed_images.append((img_url, username, date))
-                logger.error(f"Error preparing image {img_url} for {username}: {str(e)}")
-
-        if media_group:
-            try:
-                send_telegram_message(
-                    chat_id,
-                    f"📤 Sending batch {i // IMAGES_PER_BATCH + 1} of {len(image_list) // IMAGES_PER_BATCH + 1} "
-                    f"({len(media_group)} images)..."
+def send_image_batch(chat_id, images):
+    """Send a batch of up to 5 images to the Telegram group with captions."""
+    media_group = []
+    for image_url, username, date in images:
+        image_data = download_image(image_url)
+        if image_data:
+            caption = f"👤 {username}\n📅 {date}"
+            media_group.append(
+                telebot.types.InputMediaPhoto(
+                    media=image_data,
+                    caption=caption,
+                    parse_mode='Markdown'
                 )
-                bot.send_media_group(chat_id=chat_id, media=media_group)
-                logger.info(f"Successfully sent batch of {len(media_group)} images")
+            )
+        else:
+            logger.warning(f"Skipping image {image_url} due to download failure")
 
-                # Remove successful images from media_by_date_per_username
-                for img_url, username, date in successful_images:
-                    media_type = "gifs" if img_url.lower().endswith(".gif") else "images"
-                    if date in media_by_date_per_username[username][media_type]:
-                        if img_url in media_by_date_per_username[username][media_type][date]:
-                            media_by_date_per_username[username][media_type][date].remove(img_url)
-                            logger.debug(f"Removed image {img_url} for {username} from {date}")
-                        if not media_by_date_per_username[username][media_type][date]:
-                            del media_by_date_per_username[username][media_type][date]
-
-                # Notify about failed images
-                if failed_images:
-                    failed_urls = [url for url, _, _ in failed_images]
-                    send_telegram_message(
-                        chat_id,
-                        f"⚠️ Failed to download {len(failed_images)} images: {', '.join(failed_urls)}"
-                    )
-
+    if media_group:
+        for attempt in range(MAX_RETRIES):
+            try:
+                bot.send_media_group(chat_id=GROUP_CHAT_ID, media=media_group)
+                logger.info(f"Sent batch of {len(media_group)} images to group {GROUP_CHAT_ID}")
+                return True
             except ApiTelegramException as e:
-                logger.error(f"Failed to send media group: {str(e)}")
-                send_telegram_message(chat_id, f"❌ Error sending batch {i // IMAGES_PER_BATCH + 1}: {str(e)}")
+                if e.error_code == 429:
+                    retry_after = int(e.result_json.get('parameters', {}).get('retry_after', 5))
+                    logger.warning(f"429 Too Many Requests, waiting {retry_after} seconds")
+                    time.sleep(retry_after)
+                else:
+                    logger.warning(f"Failed to send media group, attempt {attempt + 1}: {str(e)}")
+                if attempt == MAX_RETRIES - 1:
+                    logger.error(f"Failed to send media group after {MAX_RETRIES} attempts")
+                    return False
+                time.sleep(1 * (attempt + 1))
             except Exception as e:
-                logger.error(f"Unexpected error sending media group: {str(e)}")
-                send_telegram_message(chat_id, f"❌ Unexpected error sending batch {i // IMAGES_PER_BATCH + 1}: {str(e)}")
-
-        time.sleep(1)  # Brief pause between batches to avoid rate limits
+                logger.warning(f"Unexpected error sending media group, attempt {attempt + 1}: {str(e)}")
+                if attempt == MAX_RETRIES - 1:
+                    logger.error(f"Failed to send media group after {MAX_RETRIES} attempts")
+                    return False
+                time.sleep(1 * (attempt + 1))
+    return False
 
 def cancel_task(chat_id):
     """Cancel an active scraping task."""
@@ -703,6 +686,54 @@ def cancel_task(chat_id):
         del active_tasks[chat_id]
         return True
     return False
+
+def process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year, progress_msg):
+    """Process and send images in batches, deleting sent images from memory."""
+    all_images = []
+    for username in usernames:
+        media_by_date = media_by_date_per_username[username]
+        for date in sorted(media_by_date['images'].keys(), reverse=True):
+            for image_url in media_by_date['images'][date]:
+                all_images.append((image_url, username, date))
+        for date in sorted(media_by_date['gifs'].keys(), reverse=True):
+            for image_url in media_by_date['gifs'][date]:
+                all_images.append((image_url, username, date))
+
+    all_images.sort(key=lambda x: x[2], reverse=True)  # Sort by date, newest first
+    total_images = len(all_images)
+    sent_images = 0
+
+    while all_images and chat_id in active_tasks:
+        batch = all_images[:BATCH_SIZE]
+        all_images = all_images[BATCH_SIZE:]  # Remove sent batch
+
+        # Send the batch
+        if send_image_batch(chat_id, batch):
+            sent_images += len(batch)
+            # Remove sent images from media_by_date_per_username
+            for image_url, username, date in batch:
+                if image_url in media_by_date_per_username[username]['images'].get(date, []):
+                    media_by_date_per_username[username]['images'][date].remove(image_url)
+                    if not media_by_date_per_username[username]['images'][date]:
+                        del media_by_date_per_username[username]['images'][date]
+                elif image_url in media_by_date_per_username[username]['gifs'].get(date, []):
+                    media_by_date_per_username[username]['gifs'][date].remove(image_url)
+                    if not media_by_date_per_username[username]['gifs'][date]:
+                        del media_by_date_per_username[username]['gifs'][date]
+
+        # Update progress
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=progress_msg.message_id,
+            text=f"🔍 Processing '{', '.join(usernames)}' ({start_year}-{end_year}): "
+                 f"Sent {sent_images}/{total_images} images ({(sent_images/total_images*100):.1f}%)"
+        )
+
+        # Free memory
+        del batch
+        time.sleep(1)  # Brief pause to avoid overwhelming Telegram API
+
+    return sent_images
 
 def handle_message(message):
     """Handle incoming Telegram messages."""
@@ -761,7 +792,7 @@ def handle_message(message):
                 username: {'images': {}, 'videos': {}, 'gifs': {}}
                 for username in usernames
             }
-            global_seen = {'images': set(), 'videos': set(), 'gifs': {}}
+            global_seen = {'images': set(), 'videos': set(), 'gifs': set()}
 
             for username_idx, username in enumerate(usernames):
                 bot.edit_message_text(
@@ -841,35 +872,36 @@ def handle_message(message):
                         logger.error(f"Unexpected post processing error for {username}: {str(e)}")
                         continue
 
+            # Process and send images in batches
+            total_images = sum(
+                sum(len(media_by_date_per_username[username]['images'][date]) +
+                    len(media_by_date_per_username[username]['gifs'][date])
+                    for date in media_by_date_per_username[username]['images'] | media_by_date_per_username[username]['gifs'])
+                for username in usernames
+            )
+            if total_images > 0:
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    text=f"🔍 Processing '{usernames_display}' ({start_year}-{end_year}): Sending {total_images} images..."
+                )
+                sent_images = process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year, progress_msg)
+            else:
+                sent_images = 0
+
+            # Generate and upload HTML
+            html_content = create_html(media_by_date_per_username, usernames, start_year, end_year)
             bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
 
-            # Collect all images (including GIFs) in order
-            image_list = []
-            for username in usernames:
-                media_by_date = media_by_date_per_username[username]
-                for media_type in ['images', 'gifs']:
-                    for date in sorted(media_by_date[media_type].keys(), reverse=True):
-                        for img_url in media_by_date[media_type][date]:
-                            image_list.append((img_url, username, date))
-
-            total_items = len(image_list)
-            if total_items == 0:
-                send_telegram_message(
-                    chat_id,
-                    text=f"⚠️ No images found for '{usernames_display}' ({start_year}-{end_year})"
-                )
-            else:
-                send_telegram_message(
-                    chat_id,
-                    text=f"📸 Found {total_items} images for '{usernames_display}' ({start_year}-{end_year}). Starting upload..."
-                )
-                send_telegram_images(chat_id, image_list, media_by_date_per_username, usernames, start_year, end_year)
-
-            # Generate and upload HTML as before
-            html_content = create_html(media_by_date_per_username, usernames, start_year, end_year)
             if html_content:
                 html_file = BytesIO(html_content.encode('utf-8'))
                 filename = f"{'_'.join(username.replace(' ', '_') for username in usernames)}_media.html"
+                total_items = sum(
+                    sum(len(media_by_date_per_username[username][media_type][date])
+                        for media_type in media_by_date_per_username[username]
+                        for date in media_by_date_per_username[username][media_type])
+                    for username in usernames
+                )
                 file_size_mb = len(html_content.encode('utf-8')) / (1024 * 1024)
 
                 progress_msg = send_telegram_message(
@@ -883,7 +915,7 @@ def handle_message(message):
                         chat_id,
                         text=(
                             f"✅ Uploaded {filename}\n"
-                            f"Found {total_items} media items for '{usernames_display}' ({start_year}-{end_year})\n"
+                            f"Found {total_items} media items (Sent {sent_images} images) for '{usernames_display}' ({start_year}-{end_year})\n"
                             f"Raw File: {url}\n"
                             f"Rendered: https://htmlpreview.github.io/?{url}"
                         )
@@ -993,14 +1025,15 @@ def run_flask_app():
 if __name__ == "__main__":
     try:
         TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+        GROUP_CHAT_ID = os.environ['GROUP_CHAT_ID']
         bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
         from threading import Thread
         Thread(target=start_bot).start()
         run_flask_app()
 
-    except KeyError:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable not set!")
+    except KeyError as e:
+        logger.error(f"Environment variable not set: {str(e)}")
         raise
     except Exception as e:
         logger.error(f"Failed to initialize bot: {str(e)}\n{traceback.format_exc()}")
