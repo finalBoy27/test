@@ -652,23 +652,27 @@ def send_telegram_message(chat_id, text, **kwargs):
             time.sleep(1 * (attempt + 1))
 
 def send_image_batch(chat_id, images):
-    """Send a batch of up to 5 images to the Telegram group with username captions."""
+    """Send a batch of up to 5 images to the Telegram group with a single username caption."""
     media_group = []
-    usernames = []  # to collect usernames for caption
 
-    for image_url, username, _ in images:
+    first_username = None
+
+    for i, (image_url, username, _) in enumerate(images):
         image_data = download_image(image_url)
         if image_data:
-            media_group.append(
-                telebot.types.InputMediaPhoto(media=image_data)
-            )
-            usernames.append(username)
+            media = telebot.types.InputMediaPhoto(media=image_data)
+
+            # Set the first username as caption (only once)
+            if first_username is None:
+                first_username = username
+
+            media_group.append(media)
         else:
             logger.warning(f"Skipping image {image_url} due to download failure")
 
     if media_group:
-        # Add caption to ONLY the first image
-        media_group[0].caption = "\n".join(usernames)
+        # Set caption ONLY on first image
+        media_group[0].caption = first_username
         media_group[0].parse_mode = 'Markdown'
 
         for attempt in range(MAX_RETRIES):
