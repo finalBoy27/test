@@ -347,7 +347,7 @@ def process_post(post_link, username, start_year, end_year, media_by_date, globa
         logger.error(f"Failed to process post {post_link}: {str(e)}")
 
 def create_html(media_by_date_per_username, usernames, start_year, end_year):
-    """Generate HTML with lazy loading for images and videos."""
+    """Generate HTML with lazy loading for all media (images, GIFs, videos) in chronological order."""
     usernames_str = ", ".join(usernames)
     title = f"{usernames_str} - Media Gallery"
     logger.debug(f"Generating HTML for usernames: {usernames_str}")
@@ -425,8 +425,9 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
 
     total_items = 0
     media_counts = {}
+    all_media = []
     for username in usernames:
-        media_by_date = media_by_date_per_username[username]
+        media_by_date = media_by_date_per_username.get(username, {'images': {}, 'videos': {}, 'gifs': {}})
         count = sum(
             len(media_by_date[media_type][date])
             for media_type in media_by_date
@@ -435,13 +436,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         media_counts[username] = count
         total_items += count
 
-    if total_items == 0:
-        logger.warning(f"No media items found for {usernames_str}")
-        return None
-
-    for username in usernames:
-        media_by_date = media_by_date_per_username[username]
-        media_list = []
+        # Collect all media for this username
         for media_type in ['images', 'videos', 'gifs']:
             for date in sorted(media_by_date[media_type].keys(), reverse=True):
                 for item in media_by_date[media_type][date]:
@@ -449,14 +444,23 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
                         logger.warning(f"Skipping invalid URL for {username}: {item}")
                         continue
                     safe_src = item.replace('"', '\\"').replace('\n', '')
-                    media_list.append({'type': media_type, 'src': safe_src, 'date': date})
+                    all_media.append({'username': username, 'type': media_type, 'src': safe_src, 'date': date})
 
-        media_list = sorted(media_list, key=lambda x: x['date'], reverse=True)
+    if total_items == 0:
+        logger.warning(f"No media items found for {usernames_str}")
+        return None
+
+    # Sort all media by date (newest to oldest)
+    all_media = sorted(all_media, key=lambda x: x['date'], reverse=True)
+
+    # Group media by username for JavaScript
+    for username in usernames:
+        user_media = [item for item in all_media if item['username'] == username]
         html_fragments.append(f"      {username.replace(' ', '_')}: [\n")
-        for item in media_list:
+        for item in user_media:
             html_fragments.append(f'        {{type: "{item["type"]}", src: "{item["src"]}", date: "{item["date"]}"}},\n')
         html_fragments.append("      ],\n")
-        logger.info(f"Username {username}: {media_counts[username]} media items")
+        logger.info(f"Username {username}: {media_counts.get(username, 0)} media items")
     html_fragments.append("    };\n")
 
     html_fragments.append(f"""    const usernames = {str(list(map(lambda x: x.replace(' ', '_'), usernames)))};
@@ -689,6 +693,41 @@ def send_image_batch(chat_id, images):
                 time.sleep(1 * (attempt + 1))
     return False
 
+def process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year):
+    """Process and send images/GIFs in batches with username caption."""
+    sent_images = 0
+    all_media = []
+
+    # Collect all media with username and date
+    for username in usernames:
+        media_by_date = media_by_date_per_username.get(username, {'images': {}, 'gifs': {}})
+        all_dates = set(media_by_date['images'].keys()) | set(media_by_date['gifs'].keys())
+
+        for date in sorted(all_dates, reverse=True):
+            if not (str(start_year) <= date[:4] <= str(end_year)):
+                continue
+
+            images = media_by_date['images'].get(date, [])
+            gifs = media_by_date['gifs'].get(date, [])
+            for url in images + gifs:
+                all_media.append((url, username, date))
+
+    # Sort media by date (newest to oldest)
+    all_media = sorted(all_media, key=lambda x: x[2], reverse=True)
+
+    # Process in batches
+    for i in range(0, len(all_media), BATCH_SIZE):
+        batch = all_media[i:i + BATCH_SIZE]
+        if not batch:
+            continue
+
+        if send_image_batch(chat_id, batch):
+            sent_images += len(batch)
+        else:
+            logger.error(f"Failed to send batch {i // BATCH_SIZE + 1} for {usernames}")
+
+    return sent_images
+
 def cancel_task(chat_id):
     """Cancel an active scraping task."""
     if chat_id in active_tasks:
@@ -700,54 +739,6 @@ def cancel_task(chat_id):
         del active_tasks[chat_id]
         return True
     return False
-
-def process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year):
-    """Process and send images/GIFs in batches with username caption."""
-    from telegram import InputMediaPhoto
-    import logging
-    sent_images = 0
-    BATCH_SIZE = 10  # Telegram API limit for media group
-
-    for username in usernames:
-        # Combine images and GIFs for the username
-        media_by_date = media_by_date_per_username.get(username, {'images': {}, 'gifs': {}})
-        all_dates = set(media_by_date['images'].keys()) | set(media_by_date['gifs'].keys())
-
-        for date in sorted(all_dates):
-            # Filter media by year
-            if not (str(start_year) <= date[:4] <= str(end_year)):
-                continue
-
-            # Get images and GIFs for the date
-            images = media_by_date['images'].get(date, [])
-            gifs = media_by_date['gifs'].get(date, [])
-            all_media = images + gifs
-
-            # Process in batches of BATCH_SIZE
-            for i in range(0, len(all_media), BATCH_SIZE):
-                batch = all_media[i:i + BATCH_SIZE]
-                if not batch:
-                    continue
-
-                media_group = []
-                for url in batch:
-                    try:
-                        # Use InputMediaPhoto for both images and GIFs (Telegram handles GIFs as photos in media groups)
-                        media_group.append(InputMediaPhoto(media=url, caption=username if media_group else username))
-                    except Exception as e:
-                        logging.error(f"Failed to add media {url} for {username}: {str(e)}")
-                        continue
-
-                if media_group:
-                    try:
-                        # Send media group with username as caption for the first item
-                        send_media_group(chat_id, media_group)
-                        sent_images += len(media_group)
-                    except Exception as e:
-                        logging.error(f"Failed to send media group for {username} on {date}: {str(e)}")
-                        continue
-
-    return sent_images
 
 def handle_message(message):
     """Handle incoming Telegram messages."""
