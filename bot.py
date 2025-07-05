@@ -654,21 +654,23 @@ def send_telegram_message(chat_id, text, **kwargs):
 def send_image_batch(chat_id, images):
     """Send a batch of up to 5 images to the Telegram group with username captions."""
     media_group = []
+    usernames = []  # to collect usernames for caption
+
     for image_url, username, _ in images:
         image_data = download_image(image_url)
         if image_data:
-            caption = f"{username}"
             media_group.append(
-                telebot.types.InputMediaPhoto(
-                    media=image_data,
-                    caption=caption,
-                    parse_mode='Markdown'
-                )
+                telebot.types.InputMediaPhoto(media=image_data)
             )
+            usernames.append(username)
         else:
             logger.warning(f"Skipping image {image_url} due to download failure")
 
     if media_group:
+        # Add caption to ONLY the first image
+        media_group[0].caption = "\n".join(usernames)
+        media_group[0].parse_mode = 'Markdown'
+
         for attempt in range(MAX_RETRIES):
             try:
                 bot.send_media_group(chat_id=GROUP_CHAT_ID, media=media_group)
