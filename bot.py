@@ -27,8 +27,8 @@ app = Flask(__name__)
 
 # Configuration
 MAX_RETRIES = 3
-MAX_WORKERS = 2
-MAX_PAGES_PER_SEARCH = 10
+MAX_WORKERS = 3
+MAX_PAGES_PER_SEARCH = 5
 BASE_URL = "https://desifakes.com"
 MAX_FILE_SIZE_MB = 10  # Max file size for upload (in MB)
 POLLING_TIMEOUT = 30  # Increased timeout for polling
