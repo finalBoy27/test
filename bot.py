@@ -858,9 +858,10 @@ def handle_message(message):
 
             # Process and send images in batches
             total_images = sum(
-                sum(len(media_by_date_per_username[username]['images'][date]) +
-                    len(media_by_date_per_username[username]['gifs'][date])
-                    for date in media_by_date_per_username[username]['images'] | media_by_date_per_username[username]['gifs'])
+                sum(len(media_by_date_per_username[username]['images'].get(date, [])) +
+                    len(media_by_date_per_username[username]['gifs'].get(date, []))
+                    for date in set(media_by_date_per_username[username]['images'].keys()) | 
+                               set(media_by_date_per_username[username]['gifs'].keys()))
                 for username in usernames
             )
             if total_images > 0:
