@@ -32,10 +32,10 @@ MAX_WORKERS = 2
 MAX_PAGES_PER_SEARCH = 10
 BASE_URL = "https://desifakes.com"
 MAX_FILE_SIZE_MB = 10  # Max file size for upload (in MB)
-POLLING_TIMEOUT = 30  # Increased timeout for polling
+POLLING_TIMEOUT = 30  # Timeout for polling
 POLLING_INTERVAL = 1  # Interval between polls
 CONFLICT_RETRY_DELAY = 5  # Delay for retrying on 409 conflict
-GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')  # Add group chat ID to .env
+GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')  # Group chat ID from .env
 MAX_IMAGE_RETRIES = 3  # Max retries for downloading images
 BATCH_SIZE = 5  # Number of images per batch
 
@@ -183,14 +183,14 @@ def split_url(url, start_date, end_date, max_pages=MAX_PAGES_PER_SEARCH):
         first_end = (mid_dt - timedelta(days=1)).strftime("%Y-%m-%d")
         second_start = (mid_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        first_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={first_range[0]}", url)
-        first_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={first_range[1]}", first_url)
+        first_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={start_date}", url)
+        first_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={first_end}", first_url)
 
-        second_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={second_range[0]}", url)
-        second_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={second_range[1]}", second_url)
+        second_url = re.sub(r"c\[newer_than\]=[^&]+", f"c[newer_than]={second_start}", url)
+        second_url = re.sub(r"c\[older_than\]=[^&]+", f"c[older_than]={end_date}", second_url)
 
-        return split_url(first_url, first_range[0], first_range[1]) + \
-               split_url(second_url, second_range[0], second_range[1])
+        return split_url(first_url, start_date, first_end) + \
+               split_url(second_url, second_start, end_date)
 
     except Exception as e:
         logger.error(f"Split error for {url}: {str(e)}")
@@ -406,6 +406,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
   </div>
   <div class="masonry" id="masonry"></div>
   <script>
+    const mediaData = {{
 """]
 
     total_items = 0
@@ -424,7 +425,6 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
         logger.warning(f"No media items found for {usernames_str}")
         return None
 
-    html_fragments.append("    const mediaData = {\n")
     for username in usernames:
         media_by_date = media_by_date_per_username[username]
         media_list = []
@@ -610,7 +610,7 @@ def create_html(media_by_date_per_username, usernames, start_year, end_year):
     return html_content
 
 def send_telegram_message(chat_id, text, **kwargs):
-    """Send a Telegram message with retries."""
+    """Send a Telegram message with retries for rate limits."""
     for attempt in range(MAX_RETRIES):
         try:
             return bot.send_message(chat_id=chat_id, text=text, **kwargs)
@@ -634,12 +634,12 @@ def send_telegram_message(chat_id, text, **kwargs):
             time.sleep(1 * (attempt + 1))
 
 def send_image_batch(chat_id, images):
-    """Send a batch of up to 5 images to the Telegram group with captions."""
+    """Send a batch of up to 5 images to the Telegram group with username captions."""
     media_group = []
-    for image_url, username, date in images:
+    for image_url, username, _ in images:
         image_data = download_image(image_url)
         if image_data:
-            caption = f"👤 {username}\n📅 {date}"
+            caption = f"{username}"
             media_group.append(
                 telebot.types.InputMediaPhoto(
                     media=image_data,
@@ -687,7 +687,7 @@ def cancel_task(chat_id):
         return True
     return False
 
-def process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year, progress_msg):
+def process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year):
     """Process and send images in batches, deleting sent images from memory."""
     all_images = []
     for username in usernames:
@@ -720,14 +720,6 @@ def process_and_send_images(chat_id, media_by_date_per_username, usernames, star
                     media_by_date_per_username[username]['gifs'][date].remove(image_url)
                     if not media_by_date_per_username[username]['gifs'][date]:
                         del media_by_date_per_username[username]['gifs'][date]
-
-        # Update progress
-        bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=progress_msg.message_id,
-            text=f"🔍 Processing '{', '.join(usernames)}' ({start_year}-{end_year}): "
-                 f"Sent {sent_images}/{total_images} images ({(sent_images/total_images*100):.1f}%)"
-        )
 
         # Free memory
         del batch
@@ -780,10 +772,6 @@ def handle_message(message):
         end_year = int(parts[-1]) if len(parts) > 1 else datetime.now().year
 
         usernames_display = ", ".join(usernames)
-        progress_msg = send_telegram_message(
-            chat_id, f"🔍 Processing '{usernames_display}' ({start_year}-{end_year})..."
-        )
-
         executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         active_tasks[chat_id] = (executor, [])
 
@@ -795,12 +783,6 @@ def handle_message(message):
             global_seen = {'images': set(), 'videos': set(), 'gifs': set()}
 
             for username_idx, username in enumerate(usernames):
-                bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    text=f"🔍 Processing '{usernames_display}' ({start_year}-{end_year}): Scraping '{username}'..."
-                )
-
                 all_post_links = []
                 seen_links = set()
                 search_links = generate_links(start_year, end_year, username, title_only)
@@ -848,23 +830,11 @@ def handle_message(message):
                     )
                 active_tasks[chat_id] = (executor, post_futures)
 
-                processed_count = 0
-                total_posts = len(all_post_links)
-                update_step = max(1, total_posts // 2)
                 for future in as_completed(post_futures):
                     if chat_id not in active_tasks:
                         raise ScraperError("Task cancelled by user")
                     try:
                         future.result()
-                        processed_count += 1
-                        if processed_count % update_step == 0 or processed_count == total_posts:
-                            bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=progress_msg.message_id,
-                                text=f"🔍 Processing '{usernames_display}' ({start_year}-{end_year}): "
-                                     f"'{username}' - {processed_count}/{total_posts} posts "
-                                     f"({(processed_count/total_posts*100):.1f}%)"
-                            )
                     except ScraperError as e:
                         logger.error(f"Post processing failed for {username}: {str(e)}")
                         continue
@@ -880,19 +850,12 @@ def handle_message(message):
                 for username in usernames
             )
             if total_images > 0:
-                bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    text=f"🔍 Processing '{usernames_display}' ({start_year}-{end_year}): Sending {total_images} images..."
-                )
-                sent_images = process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year, progress_msg)
+                sent_images = process_and_send_images(chat_id, media_by_date_per_username, usernames, start_year, end_year)
             else:
                 sent_images = 0
 
             # Generate and upload HTML
             html_content = create_html(media_by_date_per_username, usernames, start_year, end_year)
-            bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
-
             if html_content:
                 html_file = BytesIO(html_content.encode('utf-8'))
                 filename = f"{'_'.join(username.replace(' ', '_') for username in usernames)}_media.html"
@@ -902,15 +865,8 @@ def handle_message(message):
                         for date in media_by_date_per_username[username][media_type])
                     for username in usernames
                 )
-                file_size_mb = len(html_content.encode('utf-8')) / (1024 * 1024)
-
-                progress_msg = send_telegram_message(
-                    chat_id, f"🔍 Uploading {filename} ({file_size_mb:.2f} MB)..."
-                )
-
                 try:
                     url = upload_file(html_file, filename)
-                    bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
                     send_telegram_message(
                         chat_id,
                         text=(
@@ -921,9 +877,8 @@ def handle_message(message):
                         )
                     )
                 except ScraperError as e:
-                    bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=progress_msg.message_id,
+                    send_telegram_message(
+                        chat_id,
                         text=f"❌ Upload failed for '{usernames_display}': {str(e)}"
                     )
             else:
@@ -934,22 +889,19 @@ def handle_message(message):
 
         except ScraperError as e:
             if str(e) == "Task cancelled by user":
-                bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
+                send_telegram_message(
+                    chat_id,
                     text=f"🛑 Scraping stopped for '{usernames_display}'"
                 )
             else:
-                bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
+                send_telegram_message(
+                    chat_id,
                     text=f"❌ Error for '{usernames_display}': {str(e)}"
                 )
                 logger.error(f"Scraper error: {str(e)}\n{traceback.format_exc()}")
         except Exception as e:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=progress_msg.message_id,
+            send_telegram_message(
+                chat_id,
                 text=f"❌ Error for '{usernames_display}': {str(e)}"
             )
             logger.error(f"Error processing {usernames_display}: {str(e)}\n{traceback.format_exc()}")
@@ -962,35 +914,36 @@ def handle_message(message):
 
     except Exception as e:
         logger.critical(f"Unhandled error: {str(e)}\n{traceback.format_exc()}")
-        if 'chat_id' in locals() and 'progress_msg' in locals():
+        if 'chat_id' in locals():
             try:
-                bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
+                send_telegram_message(
+                    chat_id,
                     text=f"❌ Critical error: {str(e)}"
                 )
             except:
                 pass
-        if chat_id in active_tasks:
+        if 'chat_id' in locals() and chat_id in active_tasks:
             executor, _ = active_tasks[chat_id]
             executor._threads.clear()
             executor.shutdown(wait=False)
             del active_tasks[chat_id]
 
 def start_bot():
-    """Start the Telegram bot with retry on 409 conflicts."""
+    """Start the Telegram bot with polling."""
     max_attempts = 5
     for attempt in range(max_attempts):
         try:
             logger.info(f"Attempting to start bot polling (attempt {attempt + 1})...")
-            bot.remove_webhook()
-            time.sleep(1)
             bot.message_handler(commands=['start'])(handle_message)
             bot.message_handler(func=lambda message: True)(handle_message)
             bot.polling(none_stop=True, interval=POLLING_INTERVAL, timeout=POLLING_TIMEOUT)
             break
         except ApiTelegramException as e:
-            if e.error_code == 409:
+            if e.error_code == 429:  # Too Many Requests
+                retry_after = int(e.result_json.get('parameters', {}).get('retry_after', 5))
+                logger.warning(f"429 Too Many Requests, waiting {retry_after} seconds")
+                time.sleep(retry_after)
+            elif e.error_code == 409:
                 logger.warning(f"409 Conflict detected on attempt {attempt + 1}: {str(e)}")
                 if attempt < max_attempts - 1:
                     logger.info(f"Retrying after {CONFLICT_RETRY_DELAY} seconds...")
