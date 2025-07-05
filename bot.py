@@ -14,6 +14,8 @@ import traceback
 import time
 import cloudscraper
 from telebot.apihelper import ApiTelegramException
+import fcntl
+import sys
 
 load_dotenv()
 
@@ -28,22 +30,34 @@ app = Flask(__name__)
 
 # Configuration
 MAX_RETRIES = 3
-MAX_WORKERS = 2
+MAX_WORKERS = 3
 MAX_PAGES_PER_SEARCH = 10
 BASE_URL = "https://desifakes.com"
 MAX_FILE_SIZE_MB = 10  # Max file size for upload (in MB)
 POLLING_TIMEOUT = 30  # Timeout for polling
 POLLING_INTERVAL = 1  # Interval between polls
-CONFLICT_RETRY_DELAY = 5  # Delay for retrying on 409 conflict
+CONFLICT_RETRY_DELAY = 10  # Increased delay for 409 conflict retries
 GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')  # Group chat ID from .env
 MAX_IMAGE_RETRIES = 3  # Max retries for downloading images
 BATCH_SIZE = 5  # Number of images per batch
+LOCK_FILE = "/tmp/bot.lock"  # File-based lock to prevent multiple instances
 
 # Global task tracking
 active_tasks = {}
 
 class ScraperError(Exception):
     pass
+
+def acquire_lock():
+    """Acquire a file-based lock to ensure single instance."""
+    lock_file = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("Lock acquired successfully")
+        return lock_file
+    except IOError:
+        logger.error("Another instance is already running. Exiting.")
+        sys.exit(1)
 
 def make_request(url, method='get', **kwargs):
     """Make a request using cloudscraper to bypass Cloudflare."""
@@ -929,8 +943,9 @@ def handle_message(message):
             del active_tasks[chat_id]
 
 def start_bot():
-    """Start the Telegram bot with polling."""
-    max_attempts = 5
+    """Start the Telegram bot with polling and single-instance enforcement."""
+    lock_file = acquire_lock()  # Ensure only one instance runs
+    max_attempts = 10  # Increased retries for robustness
     for attempt in range(max_attempts):
         try:
             logger.info(f"Attempting to start bot polling (attempt {attempt + 1})...")
@@ -962,6 +977,9 @@ def start_bot():
             else:
                 logger.error("Max retries reached. Exiting.")
                 raise
+        finally:
+            if 'lock_file' in locals():
+                lock_file.close()
 
 @app.route('/')
 def home():
